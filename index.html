@@ -219,7 +219,11 @@ DATA.products.forEach(p => {
     [['Website', 1], ['North Melbourne store', .7]].forEach(([ch, f]) => {
       const boost = mi >= 9 ? 1.2 : 1;               // Oct–Nov lift
       const units = Math.round(p.base * f * boost * (.6 + R() * .8));
-      DATA.sales.push({m:mi, sku:p.id, ch, units, revenue: units * p.price});
+      const disc = mi === 10 ? 0.2 : 0;                       // November Black Friday sale
+      const orders = Math.max(1, Math.round(units / (ch === 'Website' ? 1.4 : 1.2)));
+      const repeat = Math.round(orders * (ch === 'Website' ? 0.32 : 0.18));
+      DATA.sales.push({m:mi, sku:p.id, ch, units, list: units * p.price,
+        revenue: Math.round(units * p.price * (1 - disc)), saleUnits: disc ? units : 0, orders, repeat});
     });
   });
 });
@@ -289,6 +293,47 @@ function panel() {
     <button class="ghost" data-clear>Clear selection</button></section>`;
 }
 
+/* ---------- Sales metrics ---------- */
+const aggSales = rows => rows.reduce((o, r) => ({
+  units: o.units + r.units, revenue: o.revenue + r.revenue, list: o.list + r.list,
+  orders: o.orders + r.orders, repeat: o.repeat + r.repeat, saleUnits: o.saleUnits + r.saleUnits
+}), {units:0, revenue:0, list:0, orders:0, repeat:0, saleUnits:0});
+const ratio = (a, b) => b ? a / b : 0;
+function salesKpis() {
+  const ids = fpIds();
+  const rows = DATA.sales.filter(r => ids.includes(r.sku) && inRange(r.m));
+  const all = aggSales(rows);
+  const web = aggSales(rows.filter(r => r.ch === 'Website'));
+  const store = aggSales(rows.filter(r => r.ch === 'North Melbourne store'));
+  return {
+    aovAll: ratio(all.revenue, all.orders), aovWeb: ratio(web.revenue, web.orders), aovStore: ratio(store.revenue, store.orders),
+    discountDepth: 1 - ratio(all.revenue, all.list), saleShare: ratio(all.saleUnits, all.units),
+    repeatAll: ratio(all.repeat, all.orders), repeatWeb: ratio(web.repeat, web.orders), repeatStore: ratio(store.repeat, store.orders)
+  };
+}
+/* Months from launch until current stock sells out, at the last three months' sales rate */
+function sellOutMonths(p) {
+  if (p.stage !== 'Launched') return null;
+  const recent = sum(DATA.sales.filter(r => r.sku === p.id && r.m >= 8), 'units') / 3;
+  if (!recent) return null;
+  return (11 - p.launch) + sizeTotal(p.id) / recent;
+}
+const soText = p => { const v = sellOutMonths(p); return v === null ? '—' : v.toFixed(1) + ' months'; };
+
+/* ---------- Inventory metrics ---------- */
+/* Weekly rate uses the last 13 weeks (Sep–Nov). Dead stock = launched, in stock, no sales in that window. */
+function invMetrics(p) {
+  const recent = sum(DATA.sales.filter(r => r.sku === p.id && r.m >= 8), 'units');
+  const weekly = recent / 13, stock = sizeTotal(p.id), sold = stats(p.id).sold;
+  return {
+    weekly, weeks: weekly ? stock / weekly : null, ratio: sold ? stock / sold : null,
+    dead: p.stage === 'Launched' && recent === 0 && stock > 0
+  };
+}
+const weeksText = m => m.weeks === null ? '—' : m.weeks.toFixed(1) + ' wks';
+const ratioText = m => m.ratio === null ? '—' : m.ratio.toFixed(2) + '×';
+function coverClass(m) { if (m.weeks === null) return 'na'; return m.weeks < 12 ? 'low' : m.weeks > 26 ? 'over' : ''; }
+
 /* ---------- Views ---------- */
 const V = {};
 const pending = [];
@@ -357,17 +402,24 @@ V.inventory = () => {
   queue('chSize', {type:'bar', data:{labels:DATA.sizes.map(z => 'AU ' + z), datasets:[{label:'Units on hand', data:bySize, backgroundColor:css('--accent2'), borderRadius:6}]},
     options:{plugins:{legend:{display:false}}}});
   const cls = (q, p) => p.stage !== 'Launched' ? 'na' : q <= 2 ? 'low' : q >= 16 ? 'over' : '';
+  const live = fp().filter(p => p.stage === 'Launched');
+  const weeklyAll = live.reduce((a, p) => a + invMetrics(p).weekly, 0);
+  const stockAll = live.reduce((a, p) => a + sizeTotal(p.id), 0);
+  const soldAll = live.reduce((a, p) => a + stats(p.id).sold, 0);
+  const deadUnits = live.filter(p => invMetrics(p).dead).reduce((a, p) => a + sizeTotal(p.id), 0);
+  const invStrip = `<div class="kpis">${kpi('Weeks of cover', weeklyAll ? (stockAll / weeklyAll).toFixed(1) + ' wks' : '—', 'Stock ÷ last 13 weeks of sales')}${kpi('Stock-to-sales', soldAll ? (stockAll / soldAll).toFixed(2) + '×' : '—', 'Stock ÷ units sold in range')}${kpi('Dead stock', deadUnits.toLocaleString() + ' units', 'No sales in the last 90 days')}</div>`;
   return `${panel()}
+  ${invStrip}
   <section class="panel" style="margin-top:12px"><h3 style="margin-top:0">Stock in ${DATA.warehouse} by size</h3><div class="chart"><canvas id="chSize"></canvas></div></section>
   <h3>Stock by SKU and size</h3>
-  <div class="tablewrap"><table><thead><tr><th>Product</th>${DATA.sizes.map(z => `<th>${z}</th>`).join('')}<th>Bin</th><th>Reorder point</th><th>Status</th></tr></thead><tbody>
-  ${ps.map(p => { const tot = sizeTotal(p.id); const low = DATA.sizes.filter(z => DATA.stock[p.id][z] <= 2).length;
+  <div class="tablewrap"><table><thead><tr><th>Product</th>${DATA.sizes.map(z => `<th>${z}</th>`).join('')}<th>Bin</th><th>Reorder point</th><th>Weeks of cover</th><th>Stock : sales</th><th>Status</th></tr></thead><tbody>
+  ${ps.map(p => { const m = invMetrics(p); const tot = sizeTotal(p.id); const low = DATA.sizes.filter(z => DATA.stock[p.id][z] <= 2).length;
     const status = p.stage !== 'Launched' ? badge('Pre-launch', 'info') : tot <= p.reorder ? badge('Reorder', 'bad') : low ? badge(low + ' sizes low', 'warn') : badge('OK', 'ok');
     return `<tr data-sku="${p.id}" class="${S.sku === p.id ? 'sel' : ''}"><td><div class="tp">${thumb(p)}<div><b>${p.name}</b><br><small class="muted">${p.colour}</small></div></div></td>
     ${DATA.sizes.map(z => `<td class="${cls(DATA.stock[p.id][z], p)}">${p.stage !== 'Launched' ? '–' : DATA.stock[p.id][z]}</td>`).join('')}
-    <td>${p.location}</td><td>${p.reorder}</td><td>${status}</td></tr>`; }).join('')}
+    <td>${p.location}</td><td>${p.reorder}</td><td class="${coverClass(m)}">${weeksText(m)}</td><td>${ratioText(m)}</td><td>${status}</td></tr>`; }).join('')}
   </tbody></table></div>
-  <p class="note">Low = 2 or fewer units in a size. Overstock = 16 or more. Stock shown is warehouse stock; the North Melbourne store is not yet split out as its own location.</p>`;
+  <p class="note">Weeks of cover in red is under 12 weeks, around the China sea-freight lead time. In amber it is over 26 weeks. Low = 2 or fewer units in a size. Overstock = 16 or more. Stock shown is warehouse stock; the North Melbourne store is not yet split out as its own location.</p>`;
 };
 
 V.sales = () => {
@@ -388,16 +440,19 @@ V.sales = () => {
       <div class="st-pct">${w}%</div></div>`;
   }).join('');
   const top = [...st].sort((a, b) => b.rev - a.rev);
+  const k = salesKpis();
+  const kpiStrip = `<div class="kpis">${kpi('Avg order value', money(k.aovAll), `Website ${money(k.aovWeb)} · Store ${money(k.aovStore)}`)}${kpi('Discount depth', pct(k.discountDepth), `${pct(k.saleShare)} of units sold on sale`)}${kpi('Repeat purchase rate', pct(k.repeatAll), `Website ${pct(k.repeatWeb)} · Store ${pct(k.repeatStore)}`)}</div>`;
   return `${panel()}
+  ${kpiStrip}
   <div style="margin-top:12px;display:grid;gap:16px">
     <section class="panel"><h3 style="margin-top:0">Sales trend (units by channel)</h3><div class="chart"><canvas id="chTrend"></canvas></div></section>
     <section class="panel"><h3 style="margin-top:0">Sell-through by product</h3><p class="muted" style="margin:0 0 6px;font-size:12px">Bar length shows the share of stock sold. Photos sit at the end of each bar.</p><div class="st-list">${stRows}</div></section>
   </div>
-  <h3>Top sellers</h3>
-  <div class="tablewrap"><table><thead><tr><th>Product</th><th>Website</th><th>North Melbourne store</th><th>Units</th><th>Revenue</th><th>Sell-through</th></tr></thead><tbody>
+  <h3>Top sellers</h3><p class="note" style="margin:0 0 8px">Time to sell out is estimated from the last three months' sales rate and current stock.</p>
+  <div class="tablewrap"><table><thead><tr><th>Product</th><th>Website</th><th>North Melbourne store</th><th>Units</th><th>Revenue</th><th>Sell-through</th><th>Time to sell out</th></tr></thead><tbody>
   ${top.map(x => `<tr data-sku="${x.p.id}" class="${S.sku === x.p.id ? 'sel' : ''}"><td><div class="tp">${thumb(x.p)}<div><b>${x.p.name}</b><br><small class="muted">${x.p.colour}</small></div></div></td>
     <td>${chUnits(x.sl, 'Website')}</td><td>${chUnits(x.sl, 'North Melbourne store')}</td>
-    <td>${x.sold.toLocaleString()}</td><td>${money(x.rev)}</td><td>${pct(x.st)}</td></tr>`).join('')}
+    <td>${x.sold.toLocaleString()}</td><td>${money(x.rev)}</td><td>${pct(x.st)}</td><td>${soText(x.p)}</td></tr>`).join('')}
   </tbody></table></div>`;
 };
 
@@ -597,7 +652,8 @@ function snapshot() {
       produced: o.produced, stage: o.stage, eta: o.eta, daysLate: delayOf(o), leadTimeDays: leadDays(o) })),
     salesByChannel: chRows,
     revenueOctober: revenueIn(9, ids), revenueNovember: revenueIn(10, ids),
-    alerts: alerts().map(a => a.t)
+    alerts: alerts().map(a => a.t),
+    salesKpis: salesKpis()
   };
 }
 function addMsg(role, text) {
